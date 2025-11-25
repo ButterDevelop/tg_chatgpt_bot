@@ -1,5 +1,7 @@
 # Telegram ChatGPT Bot with Telegram Stars Billing
 
+Project link: [@tg_own_gpt_bot](https://t.me/tg_own_gpt_bot)
+
 This project is a Telegram bot that acts as a "bridge" between Telegram and OpenAI (ChatGPT)
 using the **OpenAI Responses API**. The bot supports text, images, files, chat history,
 and a paid access model for regular users via **Telegram Stars**.
