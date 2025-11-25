@@ -1,0 +1,22 @@
+# ==============================
+# File: bot.service (systemd unit for Linux)
+# ==============================
+# Place at: /etc/systemd/system/tg-chatgpt-bot.service
+[Unit]
+Description=Telegram ChatGPT Bot
+After=network-online.target
+Wants=network-online.target
+
+
+[Service]
+Type=simple
+Restart=on-failure
+User=youruser
+WorkingDirectory=/opt/tg-chatgpt-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/tg-chatgpt-bot/.env
+ExecStart=/usr/bin/python3 /opt/tg-chatgpt-bot/tg_chatgpt_bot.py
+
+
+[Install]
+WantedBy=multi-user.target
