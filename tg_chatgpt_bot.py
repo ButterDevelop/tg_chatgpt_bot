@@ -82,8 +82,8 @@ MESSAGE_PRICE_STARS = int(os.getenv("MESSAGE_PRICE_STARS", "2"))
 # Available top-up packages
 TOPUP_OPTIONS = [10, 20, 50, 100, 200, 500, 1000]
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-TAVILY_API_KEYS_RAW = os.getenv("TAVILY_API_KEYS", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").split('#')[0].strip()
+TAVILY_API_KEYS_RAW = os.getenv("TAVILY_API_KEYS", "").split('#')[0].strip()
 TAVILY_API_KEYS = [k.strip() for k in TAVILY_API_KEYS_RAW.split(",") if k.strip()]
 if not TAVILY_API_KEYS and TAVILY_API_KEY:
     TAVILY_API_KEYS = [TAVILY_API_KEY]
@@ -907,52 +907,129 @@ def run_model_with_tools(
     # 4) trim history by budget to avoid context limit
     messages = _prune_history_to_budget(messages, hist_start_idx, CONTEXT_CHAR_BUDGET)
 
-    # 5) call OpenAI Responses API
-    # Important: tools are not passed now to avoid tool-calling loop.
-    resp = client.responses.create(
-        model=model,
-        input=messages,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        # If you want to enable your tools (web_search / open_url),
-        # add here: tools=TOOLS and write the tool_call processing loop.
-    )
+    # 5) call OpenAI Responses API with tool loop
+    total_tin = 0
+    total_tout = 0
+    final_reply_text = ""
+    final_all_blocks = []
 
-    # 6) try to extract ready text
-    reply_text = getattr(resp, "output_text", None)
-    all_blocks: List[Dict[str, Any]] = []
+    # Decide if tools are enabled for this model
+    enable_tools = "-nano" not in model.lower()
+    current_tools = TOOLS if enable_tools else None
 
-    if reply_text is None:
-        # if output_text is missing for some reason, we extract "raw" blocks ourselves
-        try:
-            all_blocks = _flatten_response(resp)
+    for iteration in range(MAX_TOOL_ITER + 1):
+        resp = client.responses.create(
+            model=model,
+            input=messages,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            tools=current_tools,
+        )
+
+        total_tin += getattr(resp, "input_tokens", 0)
+        total_tout += getattr(resp, "output_tokens", 0)
+
+        # Extract blocks
+        blocks = _flatten_response(resp)
+        final_all_blocks.extend(blocks)
+
+        # Check for tool calls
+        tool_calls = [b for b in blocks if b.get("type") == "call"]
+        
+        if not tool_calls:
+            # Final text response
             parts: List[str] = []
-            for b in all_blocks:
+            for b in blocks:
                 t = b.get("type")
                 if t in ("output_text", "input_text", "refusal", "summary_text"):
                     txt = b.get("text", "")
                     if txt:
                         parts.append(txt)
-            reply_text = "\n".join(parts).strip()
-        except Exception:
-            reply_text = ""
+            final_reply_text = "\n".join(parts).strip()
+            break
+        
+        # We have tool calls. Process them.
+        # 1. Add model's calls to history
+        messages.append({
+            "role": "assistant",
+            "content": tool_calls
+        })
 
-    if not reply_text:
-        reply_text = "(no response)"
+        # 2. Execute tools and collect results
+        results_blocks = []
+        for tc in tool_calls:
+            call_id = tc.get("id")
+            func_name = tc.get("name")
+            args = tc.get("arguments", "{}")
+            
+            try:
+                import json
+                params = json.loads(args)
+            except Exception:
+                params = {}
 
-    # 7) extract/estimate usage
+            log.info("Model called tool: %s with params %s", func_name, params)
+            
+            result_data = ""
+            try:
+                if func_name == "web_search":
+                    query = params.get("query", "")
+                    res = tavily_search(query)
+                    result_data = res.model_dump_json()
+                elif func_name == "open_url":
+                    url = params.get("url", "")
+                    res = fetch_and_extract(url)
+                    result_data = res.model_dump_json()
+                else:
+                    result_data = f"Error: Tool {func_name} not found."
+            except Exception as e:
+                log.error("Tool execution error (%s): %s", func_name, e)
+                result_data = f"Error executing tool: {str(e)}"
+
+            results_blocks.append({
+                "type": "call_result",
+                "call_id": call_id,
+                "result": result_data
+            })
+
+        # 3. Add results to history
+        messages.append({
+            "role": "assistant",
+            "content": results_blocks
+        })
+        
+        # Continue the loop for the next turn
+
+    if not final_reply_text:
+        # Fallback if we exceeded iterations or something went wrong
+        reply_text = getattr(resp, "output_text", None)
+        if reply_text is None:
+            parts: List[str] = []
+            for b in _flatten_response(resp):
+                t = b.get("type")
+                if t in ("output_text", "input_text", "refusal", "summary_text"):
+                    txt = b.get("text", "")
+                    if txt:
+                        parts.append(txt)
+            final_reply_text = "\n".join(parts).strip()
+        else:
+            final_reply_text = reply_text
+
+    if not final_reply_text:
+        final_reply_text = "(no response)"
+
+    # 7) Final usage
     usage = {
-        "input_tokens": getattr(resp, "input_tokens", 0),
-        "output_tokens": getattr(resp, "output_tokens", 0)
+        "input_tokens": total_tin,
+        "output_tokens": total_tout
     }
-    # Fallback if usage is missing from object (beta APIs sometimes differ)
+    # Fallback for usage estimation if zero
     if usage["input_tokens"] == 0:
-        # Rough estimate based on messages
         hist_text = "".join([str(p.get("content", "")) for m in messages for p in m.get("content", [])])
         usage["input_tokens"] = count_tokens(hist_text, model)
     if usage["output_tokens"] == 0:
-        usage["output_tokens"] = count_tokens(reply_text, model)
+        usage["output_tokens"] = count_tokens(final_reply_text, model)
 
-    return reply_text, all_blocks, usage
+    return final_reply_text, final_all_blocks, usage
 
 
 PROGRESS_MODE = os.getenv("PROGRESS_MODE", "delete").lower()  # "delete" | "edit"
