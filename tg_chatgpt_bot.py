@@ -119,9 +119,24 @@ MAX_HISTORY_MSGS = int(os.getenv("MAX_HISTORY_MSGS", "16"))
 MAX_TOOL_ITER = int(os.getenv("MAX_TOOL_ITER", "3"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 
+class TokenRedactionFilter(logging.Filter):
+    def __init__(self, token: str):
+        super().__init__()
+        self.token = token
+    def filter(self, record):
+        if self.token and isinstance(record.msg, str):
+            record.msg = record.msg.replace(self.token, "[REDACTED_TOKEN]")
+        return True
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Set up basic config first
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("tg-bot")
+
+# Apply token redaction filter to all handlers of the root logger
+if TELEGRAM_BOT_TOKEN:
+    token_filter = TokenRedactionFilter(TELEGRAM_BOT_TOKEN)
+    logging.getLogger().addFilter(token_filter)
 
 CONTEXT_CHAR_BUDGET  = int(os.getenv("CONTEXT_CHAR_BUDGET", "120000"))
 MAX_TEXT_PARTS_TOTAL = int(os.getenv("MAX_TEXT_PARTS_TOTAL", "18"))
@@ -817,9 +832,34 @@ def _history_block(role: str, text: str) -> Dict[str, Any]:
 
 
 def _flatten_response(resp) -> List[Dict[str, Any]]:
-    raw = resp.model_dump()
+    try:
+        raw = resp.model_dump()
+        log.debug("OpenAI Response Raw: %s", raw)
+    except Exception as e:
+        log.error("Failed to dump response: %s", e)
+        raw = {}
+
     blocks: List[Dict[str, Any]] = []
-    for item in raw.get("output", []):
+    # In some versions of the Responses API, the structure is resp.output
+    # In others it might be in choices[0].message
+    output = raw.get("output") or []
+    if not output and "choices" in raw:
+        # Fallback to chat completions style if that's what we got
+        for choice in raw.get("choices", []):
+            msg = choice.get("message", {})
+            if "content" in msg:
+                blocks.append({"type": "output_text", "text": msg["content"]})
+            if "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    blocks.append({
+                        "type": "call",
+                        "id": tc.get("id"),
+                        "name": tc.get("function", {}).get("name"),
+                        "arguments": tc.get("function", {}).get("arguments")
+                    })
+        return blocks
+
+    for item in output:
         t = item.get("type")
         if t == "message":
             for c in item.get("content", []) or []:
