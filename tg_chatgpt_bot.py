@@ -53,8 +53,8 @@ _CODE_BLOCK_RE = re.compile(r"```(?:.|\n)*?```", re.DOTALL)  # triple backticks 
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")                   # inline `code`
 _MATH_BLOCK_RE = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)     # LaTeX blocks of the form \[ ... \]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").split('#')[0].strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").split('#')[0].strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 DEFAULT_ONE_SHOT = os.getenv("DEFAULT_ONE_SHOT", "false").lower() in {"1", "true", "yes"}
@@ -145,10 +145,11 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("tg-bot")
 
-# Apply token redaction filter to all handlers of the root logger
 if TELEGRAM_BOT_TOKEN:
     token_filter = TokenRedactionFilter(TELEGRAM_BOT_TOKEN)
-    logging.getLogger().addFilter(token_filter)
+    # Apply to root and specific library loggers
+    for logger_name in [None, "httpx", "httpcore", "telegram", "tg-bot"]:
+        logging.getLogger(logger_name).addFilter(token_filter)
 
 CONTEXT_CHAR_BUDGET  = int(os.getenv("CONTEXT_CHAR_BUDGET", "120000"))
 MAX_TEXT_PARTS_TOTAL = int(os.getenv("MAX_TEXT_PARTS_TOTAL", "18"))
@@ -1005,17 +1006,13 @@ def run_model_with_tools(
             break
         
         # We have tool calls. Process them.
-        # Add model's calls to history to maintain context
-        messages.append({
-            "role": "assistant",
-            "content": tool_calls
-        })
-
-        # Execute tools and collect results
-        results_blocks = []
+        # Add model's calls as top-level ITEMS (Responses API Beta Schema)
         for tc in tool_calls:
-            # Responses API uses 'call_id' for function_call blocks
-            # Fallback to 'id' if not present
+            # Re-append exactly as they came back (type: function_call)
+            messages.append(tc)
+
+        # Execute tools and collect results as items
+        for tc in tool_calls:
             call_id = tc.get("call_id") or tc.get("id")
             func_name = tc.get("name")
             args = tc.get("arguments", "{}")
@@ -1026,7 +1023,7 @@ def run_model_with_tools(
             except Exception:
                 params = {}
 
-            log.info("Turn %d: Model called tool: %s", iteration + 1, func_name)
+            log.info("Turn %d: Executing %s", iteration + 1, func_name)
             
             result_data = ""
             try:
@@ -1044,17 +1041,12 @@ def run_model_with_tools(
                 log.error("Tool execution error (%s): %s", func_name, e)
                 result_data = f"Error executing tool: {str(e)}"
 
-            results_blocks.append({
-                "type": "call_result",
+            # Append as FunctionCallOutputItem
+            messages.append({
+                "type": "function_call_output",
                 "call_id": call_id,
-                "result": result_data
+                "output": result_data
             })
-
-        # Add results to history using 'user' role (standard for Responses API results)
-        messages.append({
-            "role": "user",
-            "content": results_blocks
-        })
         
         # Next turn in the loop
 
