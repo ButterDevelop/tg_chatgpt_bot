@@ -124,8 +124,20 @@ class TokenRedactionFilter(logging.Filter):
         super().__init__()
         self.token = token
     def filter(self, record):
-        if self.token and isinstance(record.msg, str):
+        if not self.token:
+            return True
+        # Redact potentially formatted message
+        if record.msg and isinstance(record.msg, str):
             record.msg = record.msg.replace(self.token, "[REDACTED_TOKEN]")
+        # Redact args if they are strings (like URLs in httpx/telegram)
+        if record.args:
+            new_args = []
+            for arg in record.args:
+                if isinstance(arg, str):
+                    new_args.append(arg.replace(self.token, "[REDACTED_TOKEN]"))
+                else:
+                    new_args.append(arg)
+            record.args = tuple(new_args)
         return True
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -852,8 +864,9 @@ def _flatten_response(resp) -> List[Dict[str, Any]]:
             if "tool_calls" in msg:
                 for tc in msg["tool_calls"]:
                     blocks.append({
-                        "type": "call",
+                        "type": "call", # normalize to call for internal loop
                         "id": tc.get("id"),
+                        "call_id": tc.get("id"), # fallback
                         "name": tc.get("function", {}).get("name"),
                         "arguments": tc.get("function", {}).get("arguments")
                     })
@@ -985,7 +998,7 @@ def run_model_with_tools(
             reply_parts.append("\n".join(turn_parts))
 
         # 2. Check for tool calls
-        tool_calls = [b for b in blocks if b.get("type") == "call"]
+        tool_calls = [b for b in blocks if b.get("type") in ("call", "function_call")]
         
         if not tool_calls:
             # Final turn reached
@@ -1001,7 +1014,9 @@ def run_model_with_tools(
         # Execute tools and collect results
         results_blocks = []
         for tc in tool_calls:
-            call_id = tc.get("id")
+            # Responses API uses 'call_id' for function_call blocks
+            # Fallback to 'id' if not present
+            call_id = tc.get("call_id") or tc.get("id")
             func_name = tc.get("name")
             args = tc.get("arguments", "{}")
             
