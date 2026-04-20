@@ -45,7 +45,7 @@ jobs:
             
             # Initial clone if .git doesn't exist
             if [ ! -d ".git" ]; then
-              git clone https://github.com/ButterDevelop/tg_chatgpt_bot.git .
+              git clone https://github.com/${{ github.repository }}.git .
             else
               git pull origin main
             fi
