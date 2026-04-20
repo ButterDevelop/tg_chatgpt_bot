@@ -40,8 +40,15 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
+            mkdir -p ${{ secrets.PROJECT_PATH }}
             cd ${{ secrets.PROJECT_PATH }}
-            git pull origin main
+            
+            # Initial clone if .git doesn't exist
+            if [ ! -d ".git" ]; then
+              git clone https://github.com/ButterDevelop/tg_chatgpt_bot.git .
+            else
+              git pull origin main
+            fi
             
             # 1. Create .env from .env.example
             cp .env.example .env
