@@ -14,7 +14,8 @@ A powerful, production-ready Telegram bot that bridges Telegram with OpenAI. Fea
 - **Usage Tracking**: Accurate token counting using `tiktoken` and real-time USD cost calculation.
 - **Admin Dashboard**: Enhanced `/admin` command with detailed usage stats and financial monitoring.
 - **Dockerized**: Easy deployment with Docker and Docker Compose.
-- **CI/CD Built-in**: Automatic builds and deployment using GitHub Actions and GHCR.
+- **Internet Search**: Restored and improved tool-calling for web search (via Tavily) and URL loading.
+- **Log Security**: Automatic redaction of sensitive bot tokens in all logs for safe monitoring.
 - **Robust Config**: Smart environment variable parsing (ignores inline comments).
 
 ---
@@ -33,10 +34,20 @@ The bot includes a redesigned `/admin` panel that provides:
 3. **Top-ups**: Built-in `/topup` command using Telegram Stars invoices.
 4. **Admins**: Always have free unlimited access.
 
+### 🌐 Web & Search Tools
+The bot can now dynamically use external tools:
+- **`web_search`**: Uses Tavily API to find real-time information.
+- **`open_url`**: Extracts content from specific links provided in chat.
+- Works with advanced models like GPT-4o and o1.
+
 ### 📄 Document Handling
 - **Text Files**: Embedded directly into the context.
 - **PDF Files**: Processed via OpenAI's File API for high accuracy.
 - **Export**: Export any conversation history to a beautifully formatted PDF (using WeasyPrint).
+
+### 🛡️ Security
+- **Token Masking**: All logs automatically replace your bot token with `[REDACTED_TOKEN]`.
+- **Resource Limits**: Strict Docker limits (0.5 CPU, 300MB RAM) to prevent server overload.
 
 ---
 
@@ -61,7 +72,7 @@ The fastest way to run the bot is using Docker.
    docker compose up -d
    ```
 
-The bot will be available, and your database will be safe in the `./data` volume.
+The bot will be available, and your database will be safe in the `./data` directory on your host machine (persistent mapping).
 
 ---
 
@@ -92,6 +103,8 @@ Every time you `git push` to the `main` branch, the bot is automatically built, 
 | `MESSAGE_PRICE_STARS`| How many stars to charge per message. |
 | `DB_PATH` | Path to SQLite DB (default: `/app/data/chatgpt_tg.db`). |
 | `DEFAULT_MODEL` | Default OpenAI model to use. |
+| `TAVILY_API_KEYS` | Comma-separated keys for Tavily search. |
+| `LOG_LEVEL` | Log verbosity (`INFO` or `DEBUG`). |
 
 ---
 
