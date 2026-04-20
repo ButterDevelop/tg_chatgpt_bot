@@ -1,0 +1,60 @@
+name: Build and Deploy Bot
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/butterdevelop/tg_chatgpt_bot:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ${{ secrets.PROJECT_PATH }}
+            git pull origin main
+            
+            # 1. Create .env from .env.example
+            cp .env.example .env
+            
+            # 2. Inject sensitive secrets using sed
+            sed -i "s|TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|g" .env
+            sed -i "s|OPENAI_API_KEY=.*|OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}|g" .env
+            sed -i "s|ADMIN_IDS=.*|ADMIN_IDS=${{ secrets.ADMIN_IDS }}|g" .env
+            sed -i "s|TAVILY_API_KEYS=.*|TAVILY_API_KEYS=${{ secrets.TAVILY_API_KEYS }}|g" .env
+            
+            # 3. Pull latest image and restart
+            docker compose pull
+            docker compose up -d
+            
+            # 4. Clean up old images
+            docker image prune -f

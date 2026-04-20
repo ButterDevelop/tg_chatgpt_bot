@@ -15,10 +15,12 @@ from functools import partial
 
 import re
 import io
+import datetime
 import asyncio
 import httpx
 import requests
 import threading
+import tiktoken
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -252,6 +254,9 @@ CREATE TABLE IF NOT EXISTS messages (
   chat_id INTEGER NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('system','user','assistant')),
   content TEXT NOT NULL,
+  tokens_input INTEGER DEFAULT 0,
+  tokens_output INTEGER DEFAULT 0,
+  model_id TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -276,6 +281,11 @@ CREATE TABLE IF NOT EXISTS payments (
 
 
 def db() -> sqlite3.Connection:
+    # Ensure the directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
@@ -283,6 +293,19 @@ def db() -> sqlite3.Connection:
 def db_init():
     with db() as con:
         con.executescript(SCHEMA_SQL)
+        # Migration: add columns if they don't exist
+        try:
+            con.execute("ALTER TABLE messages ADD COLUMN tokens_input INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute("ALTER TABLE messages ADD COLUMN tokens_output INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute("ALTER TABLE messages ADD COLUMN model_id TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 # ==============================
 # OpenAI client (with optional proxy)
@@ -587,11 +610,11 @@ def clear_history(chat_id: int):
         con.execute("DELETE FROM messages WHERE chat_id=\n?",(chat_id,))
 
 
-def add_message(chat_id: int, role: str, content: str):
+def add_message(chat_id: int, role: str, content: str, tokens_input: int = 0, tokens_output: int = 0, model_id: str = None):
     with db() as con:
         con.execute(
-            "INSERT INTO messages(chat_id, role, content) VALUES (?,?,?)",
-            (chat_id, role, content),
+            "INSERT INTO messages(chat_id, role, content, tokens_input, tokens_output, model_id) VALUES (?,?,?,?,?,?)",
+            (chat_id, role, content, tokens_input, tokens_output, model_id),
         )
         rows = con.execute(
             "SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
@@ -600,6 +623,93 @@ def add_message(chat_id: int, role: str, content: str):
         if rows:
             last_keep_id = rows[-1]["id"]
             con.execute("DELETE FROM messages WHERE chat_id=? AND id<?", (chat_id, last_keep_id))
+
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Returns the number of tokens in a text string."""
+    try:
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception:
+        # Fallback to rough estimate if tiktoken fails
+        return len(text) // 4
+
+
+def db_get_admin_stats() -> Dict[str, Any]:
+    with db() as con:
+        # 1. Users count
+        users_count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        
+        # 2. Total messages and chars
+        row_total = con.execute("SELECT COUNT(*), SUM(LENGTH(content)), SUM(tokens_input), SUM(tokens_output) FROM messages").fetchone()
+        total_msgs = row_total[0] or 0
+        total_chars = row_total[1] or 0
+        total_tokens_in = row_total[2] or 0
+        total_tokens_out = row_total[3] or 0
+        
+        # 3. Today (UTC)
+        row_today = con.execute(
+            "SELECT COUNT(*), SUM(LENGTH(content)), SUM(tokens_input), SUM(tokens_output) FROM messages WHERE created_at >= date('now')"
+        ).fetchone()
+        today_msgs = row_today[0] or 0
+        today_chars = row_today[1] or 0
+        today_tokens_in = row_today[2] or 0
+        today_tokens_out = row_today[3] or 0
+        
+        # 4. Monthly (UTC)
+        row_month = con.execute(
+            "SELECT COUNT(*), SUM(LENGTH(content)), SUM(tokens_input), SUM(tokens_output) FROM messages WHERE created_at >= date('now', 'start of month')"
+        ).fetchone()
+        month_msgs = row_month[0] or 0
+        month_chars = row_month[1] or 0
+        month_tokens_in = row_month[2] or 0
+        month_tokens_out = row_month[3] or 0
+        
+        # 5. Cost calculation (Estimated)
+        # Helper to parse "$X.XX / $Y.YY"
+        prices = {}
+        for m in MODELS:
+            try:
+                p_in, p_out = m["price"].replace("$", "").split("/")
+                prices[m["id"]] = (float(p_in.strip()), float(p_out.strip()))
+            except Exception:
+                prices[m["id"]] = (0.0, 0.0)
+
+        def _get_cost(where_clause: str = ""):
+            sql = f"SELECT model_id, SUM(tokens_input), SUM(tokens_output) FROM messages {where_clause} GROUP BY model_id"
+            rows = con.execute(sql).fetchall()
+            total_usd = 0.0
+            for row in rows:
+                mid, tin, tout = row[0], row[1] or 0, row[2] or 0
+                pin, pout = prices.get(mid, (0.0, 0.0))
+                total_usd += (tin * pin / 1_000_000) + (tout * pout / 1_000_000)
+            return total_usd
+
+        cost_total = _get_cost("")
+        cost_today = _get_cost("WHERE created_at >= date('now')")
+        cost_month = _get_cost("WHERE created_at >= date('now', 'start of month')")
+
+        return {
+            "users_count": users_count,
+            "total_msgs": total_msgs,
+            "total_chars": total_chars,
+            "total_tokens_in": total_tokens_in,
+            "total_tokens_out": total_tokens_out,
+            "today_msgs": today_msgs,
+            "today_chars": today_chars,
+            "today_tokens_in": today_tokens_in,
+            "today_tokens_out": today_tokens_out,
+            "month_msgs": month_msgs,
+            "month_chars": month_chars,
+            "month_tokens_in": month_tokens_in,
+            "month_tokens_out": month_tokens_out,
+            "cost_total": cost_total,
+            "cost_today": cost_today,
+            "cost_month": cost_month,
+        }
 
 # ==============================
 # OpenAI call with tool loop (supports tool_use + function_call)
@@ -823,7 +933,20 @@ def run_model_with_tools(
     if not reply_text:
         reply_text = "(no response)"
 
-    return reply_text, all_blocks
+    # 7) extract/estimate usage
+    usage = {
+        "input_tokens": getattr(resp, "input_tokens", 0),
+        "output_tokens": getattr(resp, "output_tokens", 0)
+    }
+    # Fallback if usage is missing from object (beta APIs sometimes differ)
+    if usage["input_tokens"] == 0:
+        # Rough estimate based on messages
+        hist_text = "".join([str(p.get("content", "")) for m in messages for p in m.get("content", [])])
+        usage["input_tokens"] = count_tokens(hist_text, model)
+    if usage["output_tokens"] == 0:
+        usage["output_tokens"] = count_tokens(reply_text, model)
+
+    return reply_text, all_blocks, usage
 
 
 PROGRESS_MODE = os.getenv("PROGRESS_MODE", "delete").lower()  # "delete" | "edit"
@@ -1092,12 +1215,14 @@ async def handle_media_group(messages, update: Update, context: ContextTypes.DEF
     if other_files:      labels.append("other-files")
     base_text = (text or "").strip()
     store_text = (base_text + attach_note).strip() or "[Attachment]"
-    add_message(chat_id, "user", store_text)
+    # Count tokens for user message
+    user_tokens = count_tokens(store_text, st.model)
+    add_message(chat_id, "user", store_text, tokens_input=user_tokens, model_id=st.model)
 
     # "status" message + single model call
     async with temp_status(update, context, text=tr(update, "thinking")) as stmsg:
         try:
-            reply_text, _msgs = run_model_with_tools(
+            reply_text, _msgs, usage = run_model_with_tools(
                 model=st.model,
                 system_prompt=SYSTEM_PROMPT,
                 history=hist,
@@ -1111,7 +1236,7 @@ async def handle_media_group(messages, update: Update, context: ContextTypes.DEF
     if reply_text and reply_text != "(no response)":
         if not is_admin(uid) and should_charge:
             consume_message_credit(uid, MESSAGE_PRICE_STARS)
-        add_message(chat_id, "assistant", reply_text[:20_000])
+        add_message(chat_id, "assistant", reply_text[:20_000], tokens_input=usage["input_tokens"], tokens_output=usage["output_tokens"], model_id=st.model)
 
     # Use the album-collected 'text' as the user prompt to show in the PDF
     await send_text_or_pdf(update, reply_text or "", user_text_for_pdf=(text or attach_note or "[Attachment]"))
@@ -1269,6 +1394,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         • Текущая модель: `{st.model}`
         • Режим диалога: `{ 'one-shot (новый диалог на каждое сообщение)' if st.one_shot else 'continuous (помню историю)' }`
+        { '• Админ-панель: /admin' if is_admin(uid) else '' }
 
         Что я умею:
         • Отвечать на вопросы и просто общаться
@@ -1289,6 +1415,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         • Current model: `{st.model}`
         • Dialog mode: `{ 'one-shot (new dialog per message)' if st.one_shot else 'continuous (keeps history)' }`
+        { '• Admin dashboard: /admin' if is_admin(uid) else '' }
 
         What I can do:
         • Answer questions and chat in natural language
@@ -1305,22 +1432,71 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 
+MODELS = [
+    # Page 1
+    {"id": "gpt-5.4", "name": "GPT-5.4", "price": "$2.50 / $15.00"},
+    {"id": "gpt-5.4-mini", "name": "GPT-5.4 mini", "price": "$0.75 / $4.50"},
+    {"id": "gpt-5.4-nano", "name": "GPT-5.4 nano", "price": "$0.20 / $1.25"},
+    {"id": "gpt-5.4-pro", "name": "GPT-5.4 pro", "price": "$30.00 / $180.00"},
+    {"id": "gpt-5.2", "name": "GPT-5.2", "price": "$1.75 / $14.00"},
+    {"id": "gpt-5.2-pro", "name": "GPT-5.2 pro", "price": "$21.00 / $168.00"},
+    {"id": "gpt-5.1", "name": "GPT-5.1", "price": "$1.25 / $10.00"},
+    {"id": "gpt-5", "name": "GPT-5", "price": "$1.25 / $10.00"},
+    # Page 2
+    {"id": "gpt-5-mini", "name": "GPT-5 mini", "price": "$0.25 / $2.00"},
+    {"id": "gpt-5-nano", "name": "GPT-5 nano", "price": "$0.05 / $0.40"},
+    {"id": "gpt-5-pro", "name": "GPT-5 pro", "price": "$15.00 / $120.00"},
+    {"id": "o4-mini", "name": "o4-mini", "price": "$1.10 / $4.40"},
+    {"id": "o3", "name": "o3", "price": "$2.00 / $8.00"},
+    {"id": "o3-mini", "name": "o3-mini", "price": "$1.10 / $4.40"},
+    {"id": "o3-pro", "name": "o3-pro", "price": "$20.00 / $80.00"},
+    {"id": "gpt-4.1", "name": "GPT-4.1", "price": "$2.00 / $8.00"},
+    # Page 3
+    {"id": "gpt-4.1-mini", "name": "GPT-4.1 mini", "price": "$0.40 / $1.60"},
+    {"id": "gpt-4.1-nano", "name": "GPT-4.1 nano", "price": "$0.10 / $0.40"},
+    {"id": "gpt-4o", "name": "GPT-4o", "price": "$2.50 / $10.00"},
+    {"id": "gpt-4o-mini", "name": "GPT-4o mini", "price": "$0.15 / $0.60"},
+]
+
+
+def build_model_keyboard(page_index: int = 0):
+    page_size = 8
+    total_pages = (len(MODELS) + page_size - 1) // page_size
+    page_index = max(0, min(page_index, total_pages - 1))
+    
+    start = page_index * page_size
+    end = start + page_size
+    page_models = MODELS[start:end]
+
+    rows = []
+    for m in page_models:
+        rows.append([InlineKeyboardButton(f"{m['name']} ({m['price']})", callback_data=f"model:{m['id']}")])
+
+    # Navigation row
+    nav_row = []
+    if page_index > 0:
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"model_page:{page_index - 1}"))
+    
+    nav_row.append(InlineKeyboardButton(f"Стр. {page_index + 1}/{total_pages}", callback_data="model_noop"))
+    
+    if page_index < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"model_page:{page_index + 1}"))
+    
+    if len(nav_row) > 1: # Only add if there are buttons other than the page indicator
+        rows.append(nav_row)
+    elif len(nav_row) == 1 and total_pages > 1:
+        rows.append(nav_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_allowed_user(update.effective_user.id):
         return
-    choices = [
-        [InlineKeyboardButton("gpt-5.1",     callback_data="model:gpt-5.1")],
-        [InlineKeyboardButton("gpt-5",       callback_data="model:gpt-5")],
-        [InlineKeyboardButton("gpt-5-mini",  callback_data="model:gpt-5-mini")],
-        [InlineKeyboardButton("gpt-5-nano",  callback_data="model:gpt-5-nano")],
-        [InlineKeyboardButton("gpt-4o",      callback_data="model:gpt-4o")],
-        [InlineKeyboardButton("gpt-4o-mini", callback_data="model:gpt-4o-mini")],
-        [InlineKeyboardButton("o4-mini",     callback_data="model:o4-mini")],
-        [InlineKeyboardButton("gpt-4.1",     callback_data="model:gpt-4.1")],
-    ]
+    
     await update.effective_message.reply_text(
         tr(update, "choose_model"),
-        reply_markup=InlineKeyboardMarkup(choices),
+        reply_markup=build_model_keyboard(0),
     )
 
 
@@ -1331,6 +1507,16 @@ async def cb_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_user(update.effective_user.id):
         await q.answer(tr(update, "access_denied"))
         return
+
+    if q.data == "model_noop":
+        await q.answer()
+        return
+
+    if q.data.startswith("model_page:"):
+        page = int(q.data.split(":")[1])
+        await q.edit_message_reply_markup(reply_markup=build_model_keyboard(page))
+        return
+
     if q.data.startswith("model:"):
         model = q.data.split(":", 1)[1]
         set_model(update.effective_chat.id, model)
@@ -1371,6 +1557,45 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     clear_history(update.effective_chat.id)
     await update.effective_message.reply_text(tr(update, "history_cleared"))
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    
+    stats = db_get_admin_stats()
+    
+    # Helper to format large numbers
+    def fmt(n):
+        return f"{n:,}".replace(",", " ")
+    
+    txt = textwrap.dedent(f"""
+    ⚙️ **Админ-панель**
+    
+    👥 **Пользователи:**
+    • Всего в базе: `{fmt(stats['users_count'])}`
+    
+    💬 **Сообщения:**
+    • Всего: `{fmt(stats['total_msgs'])}`
+    • За сегодня: `{fmt(stats['today_msgs'])}`
+    
+    🪙 **Токены (Tiktoken):**
+    • Всего: `{fmt(stats['total_tokens_in'] + stats['total_tokens_out'])}` (In: {fmt(stats['total_tokens_in'])}, Out: {fmt(stats['total_tokens_out'])})
+    • Сегодня: `{fmt(stats['today_tokens_in'] + stats['today_tokens_out'])}` (In: {fmt(stats['today_tokens_in'])}, Out: {fmt(stats['today_tokens_out'])})
+    
+    💸 **Затраты (Приблизительно):**
+    • За сегодня: `{"$" + f"{stats['cost_today']:.4f}"}`
+    • За месяц: `{"$" + f"{stats['cost_month']:.4f}"}`
+    • Всего: `{"$" + f"{stats['cost_total']:.4f}"}`
+    
+    🤖 **Конфигурация:**
+    • Модель по умолчанию: `{DEFAULT_MODEL}`
+    • API Key: `{'Set ✅' if OPENAI_API_KEY else 'Missing ❌'}`
+    
+    _Статистика основана на локальном трекере токенов._
+    """)
+    
+    await update.effective_message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1650,12 +1875,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 5) we save the user's CURRENT message in the database (so that it appears in /export, etc.)
     base_text = (text or "").strip()
     store_text = (base_text + attach_note).strip() or "[Attachment]"
-    add_message(chat_id, "user", store_text)
+    user_tokens = count_tokens(store_text, st.model)
+    add_message(chat_id, "user", store_text, tokens_input=user_tokens, model_id=st.model)
 
     # 6) "status" message + single model call
     async with temp_status(update, context, text=tr(update, "thinking")) as stmsg:
         try:
-            reply_text, _msgs = run_model_with_tools(
+            reply_text, _msgs, usage = run_model_with_tools(
                 model=st.model,
                 system_prompt=SYSTEM_PROMPT,
                 history=hist,          # history without current user
@@ -3340,8 +3566,9 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("admin", cmd_admin))
     application.add_handler(CommandHandler("model", cmd_model))
-    application.add_handler(CallbackQueryHandler(cb_model, pattern=r"^model:"))
+    application.add_handler(CallbackQueryHandler(cb_model, pattern=r"^model"))
     application.add_handler(CallbackQueryHandler(cb_topup, pattern=r"^topup:"))
     application.add_handler(CommandHandler("setmodel", cmd_setmodel))
     application.add_handler(CommandHandler("mode", cmd_mode))

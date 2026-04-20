@@ -4,6 +4,7 @@ openai>=1.40.0
 python-dotenv>=1.0.1
 pydantic>=2.8.2
 httpx[socks]>=0.27.0
+tiktoken>=0.7.0
 WeasyPrint
 reportlab
 
