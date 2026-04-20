@@ -12,7 +12,7 @@ data/
 .env
 Dockerfile
 docker-compose.yml
-requirements.txt
+# requirements.txt  <-- DO NOT IGNORE, needed for build
 README.md
 LICENSE
 tg-chatgpt-bot.service
