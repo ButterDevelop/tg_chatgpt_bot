@@ -110,9 +110,9 @@ def get_lang(update: Update) -> str:
     return "en"
 
 # Optional proxy for OpenAI + reuse for requests
-OPENAI_PROXY = os.getenv("OPENAI_PROXY", "").strip()
-OPENAI_HTTP_PROXY = os.getenv("HTTP_PROXY", os.getenv("http_proxy", "")).strip()
-OPENAI_HTTPS_PROXY = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", "")).strip()
+OPENAI_PROXY = os.getenv("OPENAI_PROXY", "").split('#')[0].strip()
+OPENAI_HTTP_PROXY = (os.getenv("HTTP_PROXY") or os.getenv("http_proxy", "")).split('#')[0].strip()
+OPENAI_HTTPS_PROXY = (os.getenv("HTTPS_PROXY") or os.getenv("https_proxy", "")).split('#')[0].strip()
 
 DB_PATH = os.getenv("DB_PATH", "chatgpt_tg.db")
 MAX_HISTORY_MSGS = int(os.getenv("MAX_HISTORY_MSGS", "16"))
@@ -334,11 +334,8 @@ elif OPENAI_HTTP_PROXY or OPENAI_HTTPS_PROXY:
         proxies["https://"] = OPENAI_HTTPS_PROXY
 
 if proxies:
-    # Try modern and legacy kw names for httpx
-    try:
-        _httpx_client = httpx.Client(proxies=proxies, timeout=60.0)
-    except TypeError:
-        _httpx_client = httpx.Client(proxy=proxies, timeout=60.0)  # older httpx
+    # Modern httpx uses 'proxy' for a single proxy string
+    _httpx_client = httpx.Client(proxy=proxies, timeout=60.0)
     client = OpenAI(api_key=OPENAI_API_KEY, http_client=_httpx_client)
 else:
     client = OpenAI(api_key=OPENAI_API_KEY)
