@@ -910,7 +910,7 @@ def run_model_with_tools(
     # 5) call OpenAI Responses API with tool loop
     total_tin = 0
     total_tout = 0
-    final_reply_text = ""
+    reply_parts: List[str] = []
     final_all_blocks = []
 
     # Decide if tools are enabled for this model
@@ -932,29 +932,33 @@ def run_model_with_tools(
         blocks = _flatten_response(resp)
         final_all_blocks.extend(blocks)
 
-        # Check for tool calls
+        # 1. Always capture text from this turn if it exists
+        turn_parts: List[str] = []
+        for b in blocks:
+            t = b.get("type")
+            if t in ("output_text", "input_text", "refusal", "summary_text"):
+                txt = b.get("text", "")
+                if txt:
+                    turn_parts.append(txt)
+        
+        if turn_parts:
+            reply_parts.append("\n".join(turn_parts))
+
+        # 2. Check for tool calls
         tool_calls = [b for b in blocks if b.get("type") == "call"]
         
         if not tool_calls:
-            # Final text response
-            parts: List[str] = []
-            for b in blocks:
-                t = b.get("type")
-                if t in ("output_text", "input_text", "refusal", "summary_text"):
-                    txt = b.get("text", "")
-                    if txt:
-                        parts.append(txt)
-            final_reply_text = "\n".join(parts).strip()
+            # Final turn reached
             break
         
         # We have tool calls. Process them.
-        # 1. Add model's calls to history
+        # Add model's calls to history to maintain context
         messages.append({
             "role": "assistant",
             "content": tool_calls
         })
 
-        # 2. Execute tools and collect results
+        # Execute tools and collect results
         results_blocks = []
         for tc in tool_calls:
             call_id = tc.get("id")
@@ -967,7 +971,7 @@ def run_model_with_tools(
             except Exception:
                 params = {}
 
-            log.info("Model called tool: %s with params %s", func_name, params)
+            log.info("Turn %d: Model called tool: %s", iteration + 1, func_name)
             
             result_data = ""
             try:
@@ -991,29 +995,15 @@ def run_model_with_tools(
                 "result": result_data
             })
 
-        # 3. Add results to history
+        # Add results to history using 'user' role (standard for Responses API results)
         messages.append({
-            "role": "assistant",
+            "role": "user",
             "content": results_blocks
         })
         
-        # Continue the loop for the next turn
+        # Next turn in the loop
 
-    if not final_reply_text:
-        # Fallback if we exceeded iterations or something went wrong
-        reply_text = getattr(resp, "output_text", None)
-        if reply_text is None:
-            parts: List[str] = []
-            for b in _flatten_response(resp):
-                t = b.get("type")
-                if t in ("output_text", "input_text", "refusal", "summary_text"):
-                    txt = b.get("text", "")
-                    if txt:
-                        parts.append(txt)
-            final_reply_text = "\n".join(parts).strip()
-        else:
-            final_reply_text = reply_text
-
+    final_reply_text = "\n\n".join(reply_parts).strip()
     if not final_reply_text:
         final_reply_text = "(no response)"
 
