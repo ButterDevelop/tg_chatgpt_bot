@@ -59,8 +59,17 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 DEFAULT_ONE_SHOT = os.getenv("DEFAULT_ONE_SHOT", "false").lower() in {"1", "true", "yes"}
 
-ALLOWLIST = set(int(x.strip()) for x in os.getenv("ALLOWLIST", "").split(",") if x.strip())
-ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
+ALLOWLIST = set(
+    int(x.split('#')[0].strip()) 
+    for x in os.getenv("ALLOWLIST", "").split(",") 
+    if x.split('#')[0].strip()
+)
+ADMIN_IDS = set(
+    int(x.split('#')[0].strip()) 
+    for x in os.getenv("ADMIN_IDS", "").split(",") 
+    if x.split('#')[0].strip()
+)
+
 if not ALLOWLIST and ADMIN_IDS:
     ALLOWLIST = set(ADMIN_IDS)
 
