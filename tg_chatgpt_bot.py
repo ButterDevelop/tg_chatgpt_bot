@@ -126,18 +126,30 @@ class TokenRedactionFilter(logging.Filter):
     def filter(self, record):
         if not self.token:
             return True
-        # Redact potentially formatted message
+        # Redact potentially formatted message template
         if record.msg and isinstance(record.msg, str):
             record.msg = record.msg.replace(self.token, "[REDACTED_TOKEN]")
-        # Redact args if they are strings (like URLs in httpx/telegram)
+        
+        # Redact arguments to the log message
         if record.args:
-            new_args = []
-            for arg in record.args:
-                if isinstance(arg, str):
-                    new_args.append(arg.replace(self.token, "[REDACTED_TOKEN]"))
-                else:
-                    new_args.append(arg)
-            record.args = tuple(new_args)
+            if isinstance(record.args, dict):
+                # Handle mapping-style formatting: log.debug("msg %(key)s", {"key": "val"})
+                new_args = {}
+                for k, v in record.args.items():
+                    if isinstance(v, str):
+                        new_args[k] = v.replace(self.token, "[REDACTED_TOKEN]")
+                    else:
+                        new_args[k] = v
+                record.args = new_args
+            elif isinstance(record.args, (list, tuple)):
+                # Handle sequence-style formatting: log.debug("msg %s", val)
+                new_args = []
+                for arg in record.args:
+                    if isinstance(arg, str):
+                        new_args.append(arg.replace(self.token, "[REDACTED_TOKEN]"))
+                    else:
+                        new_args.append(arg)
+                record.args = tuple(new_args) if isinstance(record.args, tuple) else new_args
         return True
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
